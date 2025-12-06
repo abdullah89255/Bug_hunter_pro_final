@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 BUG HUNTER PRO FINAL - Enterprise Web Vulnerability Scanner
-Version: 4.0 - Unified Production Edition
+Version: 4.1 - Fixed Production Edition
 Author: Security Research Team
 License: MIT
 """
@@ -498,7 +498,13 @@ class ReconnaissanceModule:
             if not response:
                 return technologies
             
-            content = await response.text()
+            # Handle binary content
+            try:
+                content = await response.text()
+            except UnicodeDecodeError:
+                # For binary files (images, etc.), just get headers
+                content = ""
+            
             headers = response.headers
             
             # Server detection
@@ -612,11 +618,11 @@ class ReconnaissanceModule:
         return cloud_info
 
 # ============================================================================
-# CRAWLER MODULE
+# CRAWLER MODULE WITH BINARY CONTENT HANDLING
 # ============================================================================
 
 class SmartCrawler:
-    """Intelligent web crawler"""
+    """Intelligent web crawler with binary content handling"""
     
     def __init__(self, client: HTTPClient, config: ScanConfig):
         self.client = client
@@ -648,29 +654,75 @@ class SmartCrawler:
             if not response:
                 return
             
-            content = await response.text()
+            # Handle binary content (images, PDFs, etc.)
+            content_type = response.headers.get("content-type", "").lower()
+            is_binary = any(x in content_type for x in ["image/", "application/pdf", "application/octet-stream"])
             
-            # Extract endpoint info
+            if is_binary:
+                # For binary files, just record the endpoint without content
+                endpoint = {
+                    "url": str(response.url),
+                    "method": "GET",
+                    "status": response.status,
+                    "content_type": content_type,
+                    "content_length": int(response.headers.get("content-length", 0)),
+                    "forms": [],
+                    "links": [],
+                    "is_binary": True
+                }
+                
+                async with self.lock:
+                    self.endpoints.append(endpoint)
+                return
+            
+            # For text content, extract links and forms
+            try:
+                content = await response.text()
+            except UnicodeDecodeError:
+                # If we can't decode as UTF-8, treat as binary
+                endpoint = {
+                    "url": str(response.url),
+                    "method": "GET",
+                    "status": response.status,
+                    "content_type": content_type,
+                    "content_length": int(response.headers.get("content-length", 0)),
+                    "forms": [],
+                    "links": [],
+                    "is_binary": True
+                }
+                
+                async with self.lock:
+                    self.endpoints.append(endpoint)
+                return
+            
+            # Extract endpoint info for text content
             endpoint = {
                 "url": str(response.url),
                 "method": "GET",
                 "status": response.status,
-                "content_type": response.headers.get("content-type", ""),
+                "content_type": content_type,
                 "content_length": len(content),
                 "forms": self._extract_forms(content, str(response.url)),
-                "links": []
+                "links": [],
+                "is_binary": False
             }
             
             async with self.lock:
                 self.endpoints.append(endpoint)
             
-            # Extract links for further crawling
+            # Extract links for further crawling (skip binary files)
             links = self._extract_links(content, str(response.url))
+            filtered_links = []
+            
+            for link in links:
+                # Skip common binary file extensions
+                if not self._is_binary_file(link):
+                    filtered_links.append(link)
             
             # Crawl links
             if depth < self.config.depth:
                 tasks = []
-                for link in links[:20]:  # Limit for performance
+                for link in filtered_links[:20]:  # Limit for performance
                     if link not in self.visited:
                         tasks.append(self._crawl_recursive(link, depth + 1))
                 
@@ -679,6 +731,19 @@ class SmartCrawler:
                     
         except Exception as e:
             print(f"    [!] Crawling error for {url}: {e}")
+    
+    def _is_binary_file(self, url: str) -> bool:
+        """Check if URL points to a binary file"""
+        binary_extensions = [
+            '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.ico',
+            '.pdf', '.zip', '.tar', '.gz', '.rar', '.7z',
+            '.exe', '.dll', '.so', '.bin', '.dat',
+            '.mp3', '.mp4', '.avi', '.mov', '.wav',
+            '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx'
+        ]
+        
+        url_lower = url.lower()
+        return any(url_lower.endswith(ext) for ext in binary_extensions)
     
     def _extract_links(self, html: str, base_url: str) -> List[str]:
         """Extract links from HTML"""
@@ -775,7 +840,7 @@ class SmartCrawler:
             return False
 
 # ============================================================================
-# VULNERABILITY SCANNER
+# VULNERABILITY SCANNER WITH FIXED SSRF TEST
 # ============================================================================
 
 class VulnerabilityScanner:
@@ -794,13 +859,17 @@ class VulnerabilityScanner:
         
         all_findings = []
         
+        # Filter out binary endpoints (images, PDFs, etc.)
+        text_endpoints = [e for e in endpoints if not e.get("is_binary", False)]
+        
         # Test each endpoint
-        for i, endpoint in enumerate(endpoints[:100]):  # Limit for performance
+        for i, endpoint in enumerate(text_endpoints[:50]):  # Limit for performance
             if i % 10 == 0:
-                print(f"  [+] Scanning endpoint {i+1}/{min(100, len(endpoints))}")
+                print(f"  [+] Scanning endpoint {i+1}/{min(50, len(text_endpoints))}")
             
             endpoint_findings = await self.scan_single_endpoint(endpoint)
-            all_findings.extend(endpoint_findings)
+            if endpoint_findings:
+                all_findings.extend(endpoint_findings)
         
         self.findings = all_findings
         return all_findings
@@ -810,6 +879,10 @@ class VulnerabilityScanner:
         findings = []
         url = endpoint["url"]
         
+        # Skip binary endpoints
+        if endpoint.get("is_binary", False):
+            return findings
+        
         # Extract parameters from URL
         parsed = urlparse(url)
         params = self._extract_params(parsed.query)
@@ -817,16 +890,19 @@ class VulnerabilityScanner:
         # Test each parameter
         for param_name, param_value in params:
             param_findings = await self.test_parameter(url, param_name, param_value)
-            findings.extend(param_findings)
+            if param_findings:
+                findings.extend(param_findings)
         
         # Test forms
         for form in endpoint.get("forms", []):
             form_findings = await self.test_form(form)
-            findings.extend(form_findings)
+            if form_findings:
+                findings.extend(form_findings)
         
         # Test for common vulnerabilities
         common_findings = await self.test_common_vulnerabilities(url)
-        findings.extend(common_findings)
+        if common_findings:
+            findings.extend(common_findings)
         
         return findings
     
@@ -846,23 +922,28 @@ class VulnerabilityScanner:
         
         # SQL Injection
         sql_findings = await self.test_sql_injection(url, param_name, original_value)
-        findings.extend(sql_findings)
+        if sql_findings:
+            findings.extend(sql_findings)
         
         # XSS
         xss_findings = await self.test_xss(url, param_name, original_value)
-        findings.extend(xss_findings)
+        if xss_findings:
+            findings.extend(xss_findings)
         
         # Command Injection
         rce_findings = await self.test_command_injection(url, param_name, original_value)
-        findings.extend(rce_findings)
+        if rce_findings:
+            findings.extend(rce_findings)
         
         # Path Traversal
         lfi_findings = await self.test_path_traversal(url, param_name, original_value)
-        findings.extend(lfi_findings)
+        if lfi_findings:
+            findings.extend(lfi_findings)
         
         # SSRF
         ssrf_findings = await self.test_ssrf(url, param_name, original_value)
-        findings.extend(ssrf_findings)
+        if ssrf_findings:
+            findings.extend(ssrf_findings)
         
         return findings
     
@@ -1021,7 +1102,7 @@ class VulnerabilityScanner:
         return findings
     
     async def test_ssrf(self, url: str, param_name: str, original_value: str) -> List[Dict[str, Any]]:
-        """Test for SSRF"""
+        """Test for SSRF - FIXED VERSION"""
         findings = []
         
         for payload in self.payloads.get_payloads("ssrf", 3):
@@ -1050,6 +1131,8 @@ class VulnerabilityScanner:
                     
             except Exception as e:
                 continue
+        
+        return findings  # Always return a list
     
     async def test_form(self, form: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Test form for vulnerabilities"""
@@ -1200,19 +1283,22 @@ class AdvancedScanner:
             print("\n[4/6] 🏗️  CMS SCANNING")
             print("-" * 50)
             cms_findings = await self.scan_cms()
-            findings.extend(cms_findings)
+            if cms_findings:
+                findings.extend(cms_findings)
         
         if "cloud" in self.config.scan_types:
             print("\n[4/6] ☁️  CLOUD SCANNING")
             print("-" * 50)
             cloud_findings = await self.scan_cloud()
-            findings.extend(cloud_findings)
+            if cloud_findings:
+                findings.extend(cloud_findings)
         
         if "cicd" in self.config.scan_types:
             print("\n[4/6] 🔧 CI/CD SCANNING")
             print("-" * 50)
             cicd_findings = await self.scan_cicd()
-            findings.extend(cicd_findings)
+            if cicd_findings:
+                findings.extend(cicd_findings)
         
         return findings
     
@@ -1222,15 +1308,18 @@ class AdvancedScanner:
         
         # WordPress
         wp_findings = await self.scan_wordpress()
-        findings.extend(wp_findings)
+        if wp_findings:
+            findings.extend(wp_findings)
         
         # Joomla
         joomla_findings = await self.scan_joomla()
-        findings.extend(joomla_findings)
+        if joomla_findings:
+            findings.extend(joomla_findings)
         
         # Drupal
         drupal_findings = await self.scan_drupal()
-        findings.extend(drupal_findings)
+        if drupal_findings:
+            findings.extend(drupal_findings)
         
         return findings
     
@@ -1736,7 +1825,7 @@ class BugHunterPro:
         
         print("""
 ╔══════════════════════════════════════════════════════════╗
-║               BUG HUNTER PRO v4.0                        ║
+║               BUG HUNTER PRO v4.1                        ║
 ║            Unified Enterprise Scanner                    ║
 ╚══════════════════════════════════════════════════════════╝
         """)
@@ -1769,11 +1858,13 @@ class BugHunterPro:
                 
                 # Run vulnerability scanning
                 basic_findings = await self.scanner.scan_endpoints(endpoints)
-                self.findings.extend(basic_findings)
+                if basic_findings:
+                    self.findings.extend(basic_findings)
                 
                 # Run advanced scanning
                 advanced_findings = await self.advanced.scan_all()
-                self.findings.extend(advanced_findings)
+                if advanced_findings:
+                    self.findings.extend(advanced_findings)
                 
                 # Update stats
                 self.stats["end_time"] = datetime.now()
@@ -1845,12 +1936,12 @@ class BugHunterPro:
 async def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
-        description="Bug Hunter Pro v4.0 - Enterprise Web Vulnerability Scanner",
+        description="Bug Hunter Pro v4.1 - Enterprise Web Vulnerability Scanner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s -t https://example.com
-  %(prog)s -t https://example.com -m deep -w 100
+  %(prog)s -t http://testphp.vulnweb.com -m deep -w 100
   %(prog)s -t https://example.com --dashboard --output html,json
   %(prog)s -t https://example.com --scan-types cms,cloud,cicd
   %(prog)s -t https://example.com --proxy http://proxy:8080
